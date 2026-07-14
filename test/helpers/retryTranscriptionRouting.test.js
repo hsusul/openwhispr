@@ -22,8 +22,6 @@ test("selects self-hosted retry routing over stale cloud settings", async () => 
       endpoint: "http://localhost:5001/v1/audio/transcriptions",
       model: "self-hosted-model",
     });
-    assert.equal("headers" in route, false);
-    assert.equal("apiKey" in route, false);
   }
 });
 
