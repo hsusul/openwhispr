@@ -701,6 +701,95 @@ async function withFakeHttps(handler, fn) {
   }
 }
 
+async function withDelayedWriteOpen(fn) {
+  const originalCreateWriteStream = fs.createWriteStream;
+  let delayedPath = null;
+  let openArgs = null;
+  let released = false;
+  let resolveOpenRequested;
+  const openRequested = new Promise((resolve) => {
+    resolveOpenRequested = resolve;
+  });
+
+  fs.createWriteStream = (filePath) => {
+    delayedPath = filePath;
+    return originalCreateWriteStream(filePath, {
+      fs: {
+        open(...args) {
+          openArgs = args;
+          resolveOpenRequested();
+        },
+        write: fs.write.bind(fs),
+        writev: fs.writev.bind(fs),
+        close: fs.close.bind(fs),
+      },
+    });
+  };
+
+  const releaseOpen = () => {
+    if (released || !openArgs) return;
+    released = true;
+    fs.open(...openArgs);
+  };
+
+  try {
+    return await fn({ openRequested, releaseOpen, getPath: () => delayedPath });
+  } finally {
+    releaseOpen();
+    fs.createWriteStream = originalCreateWriteStream;
+  }
+}
+
+async function withCapturedWriteStream(fn) {
+  const originalCreateWriteStream = fs.createWriteStream;
+  let resolveCaptured;
+  const captured = new Promise((resolve) => {
+    resolveCaptured = resolve;
+  });
+
+  fs.createWriteStream = (...args) => {
+    const stream = originalCreateWriteStream(...args);
+    resolveCaptured({ stream, filePath: args[0] });
+    return stream;
+  };
+
+  try {
+    return await fn(captured);
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+  }
+}
+
+async function withFailingWriteOpen(fn) {
+  const originalCreateWriteStream = fs.createWriteStream;
+  let resolveOpenAttempted;
+  const openAttempted = new Promise((resolve) => {
+    resolveOpenAttempted = resolve;
+  });
+
+  fs.createWriteStream = (filePath) =>
+    originalCreateWriteStream(filePath, {
+      fs: {
+        open(...args) {
+          const callback = args[args.length - 1];
+          resolveOpenAttempted(filePath);
+          setImmediate(() => {
+            callback(Object.assign(new Error("open denied"), { code: "EACCES" }));
+          });
+        },
+        write: fs.write.bind(fs),
+        writev: fs.writev.bind(fs),
+        close: fs.close.bind(fs),
+      },
+    });
+
+  try {
+    return await fn(openAttempted);
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+  }
+}
+
 function listOwUrlTempFiles() {
   const { getSafeTempDir } = require("../../src/helpers/safeTempDir");
   return new Set(fs.readdirSync(getSafeTempDir()).filter((f) => f.startsWith("ow-url-")));
@@ -870,6 +959,257 @@ test("downloadDirect rejects with DOWNLOAD_CANCELLED on mid-stream abort and cle
     }
   );
   assert.deepEqual(listOwUrlTempFiles(), before, "cancelled download must remove its temp file");
+});
+
+test("downloadDirect waits for a delayed file open to close before reporting cancellation", async () => {
+  const ac = new AbortController();
+  let downloadPromise;
+  let downloadResponse;
+
+  await withDelayedWriteOpen(async ({ openRequested, releaseOpen, getPath }) => {
+    try {
+      await withFakeHttps(
+        (parsed, options) =>
+          options.method === "HEAD"
+            ? { response: makeDirectResponse({ statusCode: 405 }) }
+            : {
+                response: (downloadResponse = makeDirectResponse({
+                  headers: { "content-type": "audio/mpeg" },
+                })),
+                after: () => ac.abort(),
+              },
+        async () => {
+          let settlementCount = 0;
+          let rejection;
+          downloadPromise = downloader.download(
+            "https://93.184.216.34/file.mp3",
+            null,
+            ac.signal
+          );
+          downloadPromise.then(
+            () => {
+              settlementCount += 1;
+            },
+            (error) => {
+              rejection = error;
+              settlementCount += 1;
+            }
+          );
+
+          await openRequested;
+          if (!ac.signal.aborted) {
+            await new Promise((resolve) => ac.signal.addEventListener("abort", resolve, { once: true }));
+          }
+          await new Promise((resolve) => setImmediate(resolve));
+          downloadResponse.emit("error", new Error("late source error"));
+          await new Promise((resolve) => setImmediate(resolve));
+
+          assert.equal(
+            settlementCount,
+            0,
+            "download must not settle before the delayed write stream closes"
+          );
+
+          releaseOpen();
+          await assert.rejects(downloadPromise, { code: "DOWNLOAD_CANCELLED" });
+          assert.equal(settlementCount, 1);
+          assert.equal(rejection.code, "DOWNLOAD_CANCELLED");
+          assert.equal(fs.existsSync(getPath()), false, "cancelled download must remove its file");
+        }
+      );
+    } finally {
+      releaseOpen();
+      await downloadPromise?.catch(() => {});
+      const delayedPath = getPath();
+      if (delayedPath) {
+        try {
+          fs.unlinkSync(delayedPath);
+        } catch {}
+      }
+    }
+  });
+});
+
+test("downloadDirect removes a partial file when cancelled after the stream opens", async () => {
+  const ac = new AbortController();
+  let tempPath;
+
+  try {
+    await withCapturedWriteStream(async (captured) => {
+      await withFakeHttps(
+        (parsed, options) =>
+          options.method === "HEAD"
+            ? { response: makeDirectResponse({ statusCode: 405 }) }
+            : { response: makeDirectResponse({ headers: { "content-type": "audio/mpeg" } }) },
+        async () => {
+          const downloadPromise = downloader.download(
+            "https://93.184.216.34/file.mp3",
+            null,
+            ac.signal
+          );
+          const capturedStream = await captured;
+          tempPath = capturedStream.filePath;
+          if (capturedStream.stream.pending) {
+            await new Promise((resolve) => capturedStream.stream.once("open", resolve));
+          }
+
+          fs.writeFileSync(tempPath, "partial");
+          ac.abort();
+
+          await assert.rejects(downloadPromise, { code: "DOWNLOAD_CANCELLED" });
+          assert.equal(fs.existsSync(tempPath), false, "cancelled download must remove its file");
+        }
+      );
+    });
+  } finally {
+    if (tempPath) {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {}
+    }
+  }
+});
+
+test("downloadDirect rejects once and leaves no file when the destination cannot open", async () => {
+  let tempPath;
+  let settlementCount = 0;
+
+  await withFailingWriteOpen(async (openAttempted) => {
+    await withFakeHttps(
+      (parsed, options) =>
+        options.method === "HEAD"
+          ? { response: makeDirectResponse({ statusCode: 405 }) }
+          : { response: makeDirectResponse({ headers: { "content-type": "audio/mpeg" } }) },
+      async () => {
+        const downloadPromise = downloader.download(
+          "https://93.184.216.34/file.mp3",
+          null,
+          null
+        );
+        downloadPromise.then(
+          () => {
+            settlementCount += 1;
+          },
+          () => {
+            settlementCount += 1;
+          }
+        );
+        tempPath = await openAttempted;
+
+        await assert.rejects(downloadPromise, {
+          code: "DOWNLOAD_FAILED",
+          message: "open denied",
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(settlementCount, 1);
+        assert.equal(fs.existsSync(tempPath), false);
+      }
+    );
+  });
+});
+
+test("downloadDirect tolerates an already-missing destination during cleanup", async () => {
+  const ac = new AbortController();
+  const originalUnlinkSync = fs.unlinkSync;
+  let tempPath;
+
+  try {
+    await withCapturedWriteStream(async (captured) => {
+      await withFakeHttps(
+        (parsed, options) =>
+          options.method === "HEAD"
+            ? { response: makeDirectResponse({ statusCode: 405 }) }
+            : { response: makeDirectResponse({ headers: { "content-type": "audio/mpeg" } }) },
+        async () => {
+          const downloadPromise = downloader.download(
+            "https://93.184.216.34/file.mp3",
+            null,
+            ac.signal
+          );
+          const capturedStream = await captured;
+          tempPath = capturedStream.filePath;
+          if (capturedStream.stream.pending) {
+            await new Promise((resolve) => capturedStream.stream.once("open", resolve));
+          }
+
+          fs.unlinkSync = (filePath) => {
+            if (filePath === tempPath) {
+              originalUnlinkSync(filePath);
+              throw Object.assign(new Error("already removed"), { code: "ENOENT" });
+            }
+            return originalUnlinkSync(filePath);
+          };
+          ac.abort();
+
+          await assert.rejects(downloadPromise, (error) => {
+            assert.equal(error.code, "DOWNLOAD_CANCELLED");
+            assert.equal(error.cause, undefined);
+            return true;
+          });
+          assert.equal(fs.existsSync(tempPath), false);
+        }
+      );
+    });
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+    if (tempPath) {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {}
+    }
+  }
+});
+
+test("downloadDirect preserves cancellation and exposes unexpected cleanup errors", async () => {
+  const ac = new AbortController();
+  const originalUnlinkSync = fs.unlinkSync;
+  let tempPath;
+
+  try {
+    await withCapturedWriteStream(async (captured) => {
+      await withFakeHttps(
+        (parsed, options) =>
+          options.method === "HEAD"
+            ? { response: makeDirectResponse({ statusCode: 405 }) }
+            : { response: makeDirectResponse({ headers: { "content-type": "audio/mpeg" } }) },
+        async () => {
+          const downloadPromise = downloader.download(
+            "https://93.184.216.34/file.mp3",
+            null,
+            ac.signal
+          );
+          const capturedStream = await captured;
+          tempPath = capturedStream.filePath;
+          if (capturedStream.stream.pending) {
+            await new Promise((resolve) => capturedStream.stream.once("open", resolve));
+          }
+
+          fs.unlinkSync = (filePath) => {
+            if (filePath === tempPath) {
+              throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+            }
+            return originalUnlinkSync(filePath);
+          };
+          ac.abort();
+
+          await assert.rejects(downloadPromise, (error) => {
+            assert.equal(error.code, "DOWNLOAD_CANCELLED");
+            assert.equal(error.cause?.code, "EACCES");
+            return true;
+          });
+          assert.equal(fs.existsSync(tempPath), true);
+        }
+      );
+    });
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+    if (tempPath) {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {}
+    }
+  }
 });
 
 // --- selectYtDlpOutput: finished-file selection + transient cleanup ---

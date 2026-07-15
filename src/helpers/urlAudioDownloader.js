@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { finished } = require("node:stream/promises");
 const debugLogger = require("./debugLogger");
 const { getSafeTempDir } = require("./safeTempDir");
 const { getFFmpegPath } = require("./ffmpegUtils");
@@ -1064,11 +1065,27 @@ function streamToFile(
       bail(Object.assign(new Error("Download stalled"), { code: "DOWNLOAD_FAILED" }));
     });
 
-    const cleanupFile = () => {
+    const cleanupFile = async () => {
+      const closed = finished(fileStream, { cleanup: true });
       fileStream.destroy();
       try {
-        fs.unlinkSync(tempPath);
+        await closed;
       } catch {}
+      try {
+        fs.unlinkSync(tempPath);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    };
+
+    const rejectAfterCleanup = (err) => {
+      cleanupFile().then(
+        () => reject(err),
+        (cleanupError) => {
+          if (err.cause === undefined) err.cause = cleanupError;
+          reject(err);
+        }
+      );
     };
 
     const bail = (err) => {
@@ -1076,8 +1093,7 @@ function streamToFile(
       settled = true;
       stall.clear();
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
-      cleanupFile();
-      reject(err);
+      rejectAfterCleanup(err);
     };
 
     // React to cancel even while stalled (no data events arriving).
@@ -1132,8 +1148,7 @@ function streamToFile(
         const sizeBytes = fs.statSync(tempPath).size;
         resolve(sizeBytes);
       } catch {
-        cleanupFile();
-        reject(
+        rejectAfterCleanup(
           Object.assign(new Error("Download produced no output"), { code: "DOWNLOAD_FAILED" })
         );
       }
