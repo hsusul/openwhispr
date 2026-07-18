@@ -40,9 +40,11 @@ import {
   initializeNotes,
 } from "../stores/noteStore";
 import { fetchProviders as fetchStreamingProviders } from "../stores/streamingProvidersStore";
+import { executeTranslationChain, shouldRunTranslateStep } from "../helpers/translationChain";
 import HistoryView from "./HistoryView";
 import BackgroundActionToastListener from "./notes/BackgroundActionToastListener";
 import { syncService } from "../services/SyncService.js";
+import logger from "../utils/logger";
 import AcceptInvitationModal from "./AcceptInvitationModal";
 import {
   consumePendingInvitationToken,
@@ -99,9 +101,12 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
     folderId: number;
     event: any;
   } | null>(null);
-  const [gpuAccelAvailable, setGpuAccelAvailable] = useState<{ cuda: boolean; vulkan: boolean }>({
-    cuda: false,
-    vulkan: false,
+  const [gpuAccelAvailable, setGpuAccelAvailable] = useState<{
+    transcription: boolean;
+    intelligence: boolean;
+  }>({
+    transcription: false,
+    intelligence: false,
   });
   const [gpuBannerDismissed, setGpuBannerDismissed] = useState(
     () => localStorage.getItem("gpuBannerDismissedUnified") === "true"
@@ -292,11 +297,16 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
   useEffect(() => {
     if (platform === "darwin" || gpuBannerDismissed) return;
     const detect = async () => {
-      const results = { cuda: false, vulkan: false };
+      const results = { transcription: false, intelligence: false };
       if (useLocalWhisper && localTranscriptionProvider === "whisper") {
         try {
           const status = await window.electronAPI?.getCudaWhisperStatus?.();
-          if (status?.gpuInfo.hasNvidiaGpu && !status.downloaded) results.cuda = true;
+          if (status?.gpuInfo.hasNvidiaGpu) {
+            if (!status.downloaded) results.transcription = true;
+          } else {
+            const vulkan = await window.electronAPI?.getVulkanWhisperStatus?.();
+            if (vulkan?.vulkan.available && !vulkan.downloaded) results.transcription = true;
+          }
         } catch {}
       }
       if (useCleanupModel) {
@@ -305,7 +315,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
             window.electronAPI?.detectVulkanGpu?.(),
             window.electronAPI?.getLlamaVulkanStatus?.(),
           ]);
-          if (gpu?.available && !vulkan?.downloaded) results.vulkan = true;
+          if (gpu?.available && !vulkan?.downloaded) results.intelligence = true;
         } catch {}
       }
       setGpuAccelAvailable(results);
@@ -513,8 +523,74 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
           const rawText = result.transcription.text;
           let finalTranscription = result.transcription;
 
+          // A translation dictation must re-run cleanup-then-translate on retry, not plain cleanup.
+          let handledTranslation = false;
+          if (result.transcription.route_kind === "translation") {
+            handledTranslation = true;
+            try {
+              const [
+                { default: ReasoningService },
+                { resolveReasoningRoute },
+                { getEffectiveCleanupModel },
+              ] = await Promise.all([
+                import("../services/ReasoningService"),
+                import("../helpers/audioManager"),
+                import("../stores/settingsStore"),
+              ]);
+              const settings = useSettingsStore.getState();
+              const agentName = localStorage.getItem("agentName") || null;
+              const route = resolveReasoningRoute(rawText, settings, agentName, false, true);
+              if (route.kind === "translation") {
+                const { text } = await executeTranslationChain({
+                  text: rawText,
+                  cleanupReachable: route.cleanupReachable,
+                  runCleanup: (currentText: string) =>
+                    ReasoningService.processText(
+                      currentText,
+                      getEffectiveCleanupModel(),
+                      agentName,
+                      route.cleanupConfig
+                    ),
+                  runTranslate: (currentText: string) =>
+                    ReasoningService.processText(currentText, route.model, agentName, route.config),
+                  shouldTranslate: shouldRunTranslateStep(
+                    settings.translationSourceLanguage,
+                    settings.translationTargetLanguage
+                  ),
+                  onCleanupError: (cleanupError: Error) =>
+                    logger.warn(
+                      "Cleanup step failed in translation chain, translating raw transcript",
+                      { error: cleanupError.message },
+                      "transcription"
+                    ),
+                  onEmptyTranslate: () =>
+                    logger.warn(
+                      "Translation step returned empty text, keeping previous text",
+                      {},
+                      "transcription"
+                    ),
+                });
+                if (text !== rawText) {
+                  const updated = await window.electronAPI.updateTranscriptionText(
+                    id,
+                    text,
+                    rawText
+                  );
+                  if (updated.success && updated.transcription) {
+                    finalTranscription = updated.transcription;
+                  }
+                }
+              } else {
+                // Translation disabled/unreachable since recording — fall through to cleanup.
+                handledTranslation = false;
+              }
+            } catch {
+              // Reasoning failed — keep the raw STT result
+            }
+          }
+
           // Apply AI reasoning if enabled
-          if (useCleanupModel) {
+          if (!handledTranslation && useCleanupModel) {
             try {
               const [
                 { default: ReasoningService },
@@ -837,7 +913,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
                 </div>
               </div>
             )}
-            {(gpuAccelAvailable.cuda || gpuAccelAvailable.vulkan) &&
+            {(gpuAccelAvailable.transcription || gpuAccelAvailable.intelligence) &&
               activeView === "home" &&
               !gpuBannerDismissed && (
                 <div className="max-w-3xl mx-auto w-full mb-3">
@@ -860,7 +936,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
                             className="h-7 text-xs"
                             onClick={() => {
                               setSettingsSection(
-                                gpuAccelAvailable.cuda ? "transcription" : "intelligence"
+                                gpuAccelAvailable.transcription ? "transcription" : "intelligence"
                               );
                               setShowSettings(true);
                             }}
